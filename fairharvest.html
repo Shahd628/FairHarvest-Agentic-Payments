@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>FairHarvest — Marketplace</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Public+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #f4efe2;
+      --paper: #fffdf7;
+      --ink: #23291f;
+      --muted: #6b7263;
+      --line: #ddd6c2;
+      --green: #2f6b34;
+      --green-dark: #234f27;
+      --gold: #c98a2b;
+      --chip: #eef2e3;
+      --shadow: 0 1px 0 #fff inset, 0 10px 30px rgba(45, 60, 30, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Public Sans", system-ui, sans-serif;
+      margin: 0;
+      background:
+        radial-gradient(1200px 600px at 80% -10%, #eaf0dd 0, transparent 60%),
+        var(--bg);
+      color: var(--ink);
+      line-height: 1.5;
+    }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 28px 20px 64px; }
+    header.top {
+      display: flex; align-items: baseline; justify-content: space-between;
+      gap: 16px; flex-wrap: wrap; margin-bottom: 8px;
+    }
+    .brand { display: flex; align-items: baseline; gap: 10px; }
+    .brand h1 {
+      font-family: "Fraunces", serif; font-weight: 600; font-size: 34px;
+      margin: 0; letter-spacing: -0.5px;
+    }
+    .brand .leaf { color: var(--green); font-size: 26px; }
+    .tag { color: var(--muted); font-size: 14px; }
+    .oracle-pill {
+      background: var(--paper); border: 1px solid var(--line); border-radius: 999px;
+      padding: 8px 14px; font-size: 13px; box-shadow: var(--shadow);
+    }
+    .oracle-pill b { color: var(--green-dark); font-family: "Fraunces", serif; }
+
+    .panel {
+      background: var(--paper); border: 1px solid var(--line); border-radius: 16px;
+      padding: 18px; box-shadow: var(--shadow); margin-top: 18px;
+    }
+    .panel h2 {
+      font-family: "Fraunces", serif; font-weight: 600; font-size: 20px;
+      margin: 0 0 12px;
+    }
+    .setup-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 720px) { .setup-grid { grid-template-columns: 1fr; } }
+
+    label { display: block; font-size: 12px; font-weight: 600; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.4px; margin: 0 0 6px; }
+    input {
+      width: 100%; padding: 11px 12px; border: 1px solid var(--line);
+      border-radius: 10px; background: #fff; font: inherit; color: var(--ink);
+    }
+    input:focus { outline: 2px solid #cfe0c0; border-color: var(--green); }
+    .btn {
+      cursor: pointer; border: none; border-radius: 10px; padding: 11px 16px;
+      font: inherit; font-weight: 600; background: var(--green); color: #fff;
+      transition: background .15s ease, transform .05s ease;
+    }
+    .btn:hover { background: var(--green-dark); }
+    .btn:active { transform: translateY(1px); }
+    .btn.secondary { background: #fff; color: var(--green-dark); border: 1px solid var(--line); }
+    .btn.secondary:hover { background: #f3f6ec; }
+    .btn.ghost { background: transparent; color: var(--green-dark); padding: 6px 10px; }
+    .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+
+    .status {
+      margin-top: 12px; padding: 10px 12px; border-radius: 10px; font-size: 13px;
+      background: #f2f6ea; border: 1px solid #dde7cf; color: #3c5230; min-height: 20px;
+    }
+    .status.err { background: #fbecea; border-color: #f0cfc8; color: #8a3324; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; word-break: break-all; font-size: 12px; }
+    .muted { color: var(--muted); }
+
+    /* Listings */
+    .listings { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap: 16px; }
+    .card {
+      border: 1px solid var(--line); border-radius: 14px; background: #fff;
+      padding: 16px; display: flex; flex-direction: column; gap: 8px;
+    }
+    .card .crop { font-family: "Fraunces", serif; font-size: 18px; font-weight: 600; }
+    .card .addr { font-size: 11px; }
+    .stat-row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; }
+    .stat-row span:first-child { color: var(--muted); }
+    .chip { display: inline-block; background: var(--chip); color: var(--green-dark);
+      border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
+    .empty { color: var(--muted); font-size: 14px; padding: 8px 2px; }
+
+    /* Negotiation */
+    .nego-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    .thread { border: 1px solid var(--line); border-radius: 12px; background: #fcfbf5;
+      padding: 12px; max-height: 320px; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+    .msg { max-width: 78%; padding: 9px 12px; border-radius: 12px; font-size: 14px; }
+    .msg .who { font-size: 11px; font-weight: 700; opacity: .7; display: block; margin-bottom: 2px; }
+    .msg.buyer { align-self: flex-end; background: #e7eedd; border: 1px solid #d6e3c4; }
+    .msg.agent { align-self: flex-start; background: #fff; border: 1px solid var(--line); }
+    .msg.system { align-self: center; background: transparent; color: var(--muted); font-size: 12px; }
+    .offer-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; margin-top: 12px; align-items: end; }
+    @media (max-width: 620px) { .offer-form { grid-template-columns: 1fr; } }
+    .hidden { display: none; }
+    footer.note { margin-top: 22px; font-size: 12px; color: var(--muted); }
+    code { background: #efeada; padding: 1px 5px; border-radius: 5px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div class="brand">
+        <span class="leaf">🌱</span>
+        <h1>FairHarvest</h1>
+        <span class="tag">Direct farmer ↔ buyer deals, negotiated by an AI agent · Sepolia</span>
+      </div>
+      <div class="oracle-pill" id="oraclePill">Oracle: <b id="oraclePrice">—</b> <span class="muted" id="oracleAge"></span></div>
+    </header>
+
+    <!-- 1. Connect + load -->
+    <section class="panel">
+      <h2>Connect</h2>
+      <div class="setup-grid">
+        <div>
+          <label for="marketAddr">Marketplace contract address</label>
+          <input id="marketAddr" type="text" placeholder="0x… (deployed FairHarvest contract)" />
+        </div>
+        <div>
+          <label for="oracleAddr">Price oracle address</label>
+          <input id="oracleAddr" type="text" placeholder="0x… (mock potato oracle)" />
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="connectBtn">Connect Wallet</button>
+        <button class="btn secondary" id="loadBtn">Load &amp; Browse Listings</button>
+      </div>
+      <div class="status" id="walletStatus">Wallet not connected.</div>
+      <div class="status" id="appStatus">Contract not loaded.</div>
+      <p class="muted" style="font-size:12px;margin:10px 0 0">
+        Account: <span id="account" class="mono">—</span> · Network: <span id="network">—</span>
+      </p>
+    </section>
+
+    <!-- 2. Farmer listings -->
+    <section class="panel">
+      <h2>Farmer Listings</h2>
+      <div id="listings" class="listings">
+        <div class="empty">Load the contract to discover registered farmers.</div>
+      </div>
+    </section>
+
+    <!-- 3. Negotiation (handoff to the agent) -->
+    <section class="panel hidden" id="negoPanel">
+      <div class="nego-head">
+        <h2 style="margin:0">Negotiate with Farmi 🤖</h2>
+        <span class="chip" id="negoFarmer">farmer —</span>
+        <button class="btn ghost" id="closeNego" style="margin-left:auto">✕ close</button>
+      </div>
+      <p class="muted" style="font-size:13px;margin-top:0">
+        Your offer is posted on-chain. The farmer's negotiation agent is listening and will
+        counter or accept according to the farmer's policy. The thread below updates live from contract events.
+      </p>
+
+      <div class="thread" id="thread"></div>
+
+      <div class="offer-form">
+        <div>
+          <label for="offerPrice">Your price (per 100&nbsp;kg)</label>
+          <input id="offerPrice" type="number" min="0" step="1" placeholder="e.g. 2500" />
+        </div>
+        <div>
+          <label for="offerQty">Quantity (kg)</label>
+          <input id="offerQty" type="number" min="1" step="1" placeholder="e.g. 500" />
+        </div>
+        <button class="btn" id="sendOfferBtn">Send to agent</button>
+      </div>
+      <div class="status" id="negoStatus">No offer sent yet.</div>
+    </section>
+
+    <footer class="note">
+      Prototype frontend · prices anchored to the mock oracle · all funds in escrow until 2-of-3 release.
+      Built off the team design doc.
+    </footer>
+  </div>
+
+  <script>
+    /* =========================================================================
+       PROVISIONAL ABIs — align these with the Solidity as the contract solidifies.
+       Everything the UI assumes about the contract is in this one block.
+       Assumptions flagged with  // ASSUMED
+       ========================================================================= */
+    const MARKET_ABI = [
+      // --- events used to discover farmers and follow negotiations ---
+      // ASSUMED: registerPolicy emits this so buyers can enumerate farmers (doc relies on event logs)
+      "event PolicyRegistered(address indexed farmer, uint256 minPriceRatio, uint256 maxDealSize, uint256 maxRounds, uint256 maxConcurrentDeals)",
+      "event OfferSubmitted(uint256 indexed dealId, address indexed buyer, address indexed farmer, uint256 price, uint256 quantity)",
+      "event CounterOffered(uint256 indexed dealId, uint256 price, uint8 round, address by)",
+      "event DealAccepted(uint256 indexed dealId, uint256 price)",
+      "event EscrowFunded(uint256 indexed dealId, uint256 amount)",
+      // --- reads ---
+      // public mapping getter for FarmerPolicy struct (order per design doc)
+      "function policies(address) view returns (uint256 minPriceRatio, uint256 maxDealSize, uint256 maxRounds, uint256 maxConcurrentDeals, bool isRegistered)",
+      // --- writes a buyer needs ---
+      "function submitOffer(address farmer, uint256 price, uint256 quantity) returns (uint256)",
+      "function counterOffer(uint256 dealId, uint256 price)",
+      "function acceptDeal(uint256 dealId)",
+      "function fundEscrow(uint256 dealId) payable"
+    ];
+
+    // ASSUMED: oracle getPrice returns (price, timestamp); reverts if stale (>2h) per design
+    const ORACLE_ABI = [
+      "function getPrice() view returns (uint256 price, uint256 timestamp)"
+    ];
+
+    // Block to start scanning logs from (set to your deploy block to keep it fast).
+    const DEPLOY_BLOCK = 0;
+    const CHUNK = 5000;
+
+    /* ===================================================================== */
+
+    let provider, signer, account;
+    let market, oracle;
+    let oraclePrice = null;        // BigNumber-ish, last read oracle price
+    let activeDealId = null;       // dealId of the negotiation currently open
+    let activeFarmer = null;
+
+    const $ = (id) => document.getElementById(id);
+    const walletStatus = $("walletStatus");
+    const appStatus = $("appStatus");
+    const negoStatus = $("negoStatus");
+
+    $("connectBtn").onclick = connectWallet;
+    $("loadBtn").onclick = loadContracts;
+    $("sendOfferBtn").onclick = sendOffer;
+    $("closeNego").onclick = closeNego;
+
+    function setStatus(el, msg, isErr) {
+      el.textContent = msg;
+      el.classList.toggle("err", !!isErr);
+    }
+
+    async function connectWallet() {
+      try {
+        if (!window.ethereum) { setStatus(walletStatus, "MetaMask not found.", true); return; }
+        provider = new ethers.providers.Web3Provider(window.ethereum);
+        await provider.send("eth_requestAccounts", []);
+        signer = provider.getSigner();
+        account = await signer.getAddress();
+        const net = await provider.getNetwork();
+        $("account").textContent = account;
+        $("network").textContent = `${net.name} (chainId ${net.chainId})`;
+        setStatus(walletStatus, "Connected.");
+      } catch (e) {
+        setStatus(walletStatus, "Connection failed: " + (e.message || e), true);
+      }
+    }
+
+    async function loadContracts() {
+      try {
+        if (!signer) { setStatus(appStatus, "Connect your wallet first.", true); return; }
+        const mAddr = $("marketAddr").value.trim();
+        const oAddr = $("oracleAddr").value.trim();
+        if (!ethers.utils.isAddress(mAddr)) { setStatus(appStatus, "Invalid marketplace address.", true); return; }
+
+        market = new ethers.Contract(mAddr, MARKET_ABI, signer);
+
+        if (ethers.utils.isAddress(oAddr)) {
+          oracle = new ethers.Contract(oAddr, ORACLE_ABI, signer);
+          await refreshOraclePrice();
+        }
+
+        setStatus(appStatus, "Scanning for farmer listings…");
+        await loadListings();
+        subscribeNegotiationEvents();
+        setStatus(appStatus, "Ready.");
+      } catch (e) {
+        setStatus(appStatus, "Could not load: " + (e.message || e), true);
+      }
+    }
+
+    async function refreshOraclePrice() {
+      try {
+        const [price, ts] = await oracle.getPrice();
+        oraclePrice = price;
+        $("oraclePrice").textContent = price.toString() + " / 100kg";
+        const ageMin = Math.max(0, Math.round((Date.now() / 1000 - Number(ts)) / 60));
+        $("oracleAge").textContent = `(updated ${ageMin} min ago)`;
+        // refresh floor prices already on screen
+        document.querySelectorAll("[data-floor]").forEach(applyFloor);
+      } catch (e) {
+        $("oraclePrice").textContent = "stale/unavailable";
+      }
+    }
+
+    function applyFloor(el) {
+      const ratio = Number(el.getAttribute("data-floor")); // minPriceRatio, e.g. 90
+      if (oraclePrice && ratio) {
+        const floor = oraclePrice.mul(ratio).div(100);
+        el.textContent = floor.toString() + " / 100kg";
+      } else {
+        el.textContent = ratio ? `${ratio}% of oracle` : "—";
+      }
+    }
+
+    // --- Discover farmers from PolicyRegistered logs, de-duped to latest policy ---
+    async function loadListings() {
+      const container = $("listings");
+      container.innerHTML = '<div class="empty">Scanning event logs…</div>';
+
+      const latest = await provider.getBlockNumber();
+      let from = DEPLOY_BLOCK;
+      const events = [];
+      while (from <= latest) {
+        const to = Math.min(from + CHUNK - 1, latest);
+        try {
+          const batch = await market.queryFilter(market.filters.PolicyRegistered(), from, to);
+          events.push(...batch);
+        } catch (_) { /* range with no logs / provider hiccup — keep going */ }
+        from = to + 1;
+      }
+
+      // latest policy per farmer wins
+      const byFarmer = new Map();
+      for (const ev of events) {
+        const a = ev.args;
+        byFarmer.set(a.farmer.toLowerCase(), {
+          farmer: a.farmer,
+          minPriceRatio: a.minPriceRatio.toString(),
+          maxDealSize: a.maxDealSize.toString(),
+          maxRounds: a.maxRounds.toString(),
+          maxConcurrentDeals: a.maxConcurrentDeals ? a.maxConcurrentDeals.toString() : "—",
+          block: ev.blockNumber
+        });
+      }
+
+      const farmers = [...byFarmer.values()].sort((x, y) => y.block - x.block);
+      if (!farmers.length) {
+        container.innerHTML = '<div class="empty">No registered farmers found in the scanned range. ' +
+          'Set <code>DEPLOY_BLOCK</code> to your deploy block, or have a farmer call registerPolicy().</div>';
+        return;
+      }
+
+      container.innerHTML = "";
+      farmers.forEach(renderListing);
+    }
+
+    function renderListing(f) {
+      const card = document.createElement("div");
+      card.className = "card";
+      const short = f.farmer.slice(0, 6) + "…" + f.farmer.slice(-4);
+      card.innerHTML = `
+        <div class="crop">🥔 Potatoes <span class="chip">verified policy</span></div>
+        <div class="addr mono muted">${f.farmer}</div>
+        <div class="stat-row"><span>Floor price</span><span data-floor="${f.minPriceRatio}">—</span></div>
+        <div class="stat-row"><span>Max per deal</span><span>${f.maxDealSize} kg</span></div>
+        <div class="stat-row"><span>Min price ratio</span><span>${f.minPriceRatio}% of oracle</span></div>
+        <div class="stat-row"><span>Max rounds</span><span>${f.maxRounds}</span></div>
+      `;
+      const btn = document.createElement("button");
+      btn.className = "btn";
+      btn.style.marginTop = "8px";
+      btn.textContent = "Negotiate";
+      btn.onclick = () => openNego(f.farmer, short);
+      card.appendChild(btn);
+      applyFloor(card.querySelector("[data-floor]"));
+      $("listings").appendChild(card);
+    }
+
+    // --- Negotiation handoff -------------------------------------------------
+    function openNego(farmer, short) {
+      activeFarmer = farmer;
+      activeDealId = null;
+      $("negoFarmer").textContent = "farmer " + short;
+      $("thread").innerHTML = "";
+      addMsg("system", "", "You're negotiating for potatoes. Make an offer to wake the agent.");
+      $("negoPanel").classList.remove("hidden");
+      $("negoPanel").scrollIntoView({ behavior: "smooth" });
+      setStatus(negoStatus, "Ready to send an offer.");
+    }
+
+    function closeNego() {
+      $("negoPanel").classList.add("hidden");
+      activeFarmer = null; activeDealId = null;
+    }
+
+    async function sendOffer() {
+      try {
+        if (!market || !activeFarmer) { setStatus(negoStatus, "Open a listing first.", true); return; }
+        const price = $("offerPrice").value.trim();
+        const qty = $("offerQty").value.trim();
+        if (!price || !qty) { setStatus(negoStatus, "Enter price and quantity.", true); return; }
+
+        // First message in a thread = submitOffer; subsequent buyer messages = counterOffer
+        let tx;
+        if (activeDealId === null) {
+          setStatus(negoStatus, "Submitting offer on-chain…");
+          tx = await market.submitOffer(activeFarmer, price, qty);
+        } else {
+          setStatus(negoStatus, "Sending counter-offer…");
+          tx = await market.counterOffer(activeDealId, price);
+        }
+        addMsg("buyer", "You", `Offer: ${price} / 100kg  ·  ${qty} kg`);
+        setStatus(negoStatus, "Tx sent: " + tx.hash.slice(0, 10) + "… waiting for confirmation.");
+        await tx.wait();
+        setStatus(negoStatus, "On-chain. Waiting for the agent to respond…");
+      } catch (e) {
+        setStatus(negoStatus, "Error: " + (e.message || e), true);
+      }
+    }
+
+    function subscribeNegotiationEvents() {
+      if (!market) return;
+      market.removeAllListeners();
+
+      market.on("OfferSubmitted", (dealId, buyer, farmer, price, qty) => {
+        if (account && buyer.toLowerCase() === account.toLowerCase() &&
+            activeFarmer && farmer.toLowerCase() === activeFarmer.toLowerCase()) {
+          activeDealId = dealId.toString();
+          addMsg("system", "", `Deal #${activeDealId} opened — the agent is reviewing your offer.`);
+        }
+      });
+
+      market.on("CounterOffered", (dealId, price, round, by) => {
+        if (activeDealId && dealId.toString() === activeDealId) {
+          const fromAgent = !account || by.toLowerCase() !== account.toLowerCase();
+          if (fromAgent) addMsg("agent", "Farmi 🤖", `Counter-offer: ${price.toString()} / 100kg  (round ${round})`);
+        }
+      });
+
+      market.on("DealAccepted", (dealId, price) => {
+        if (activeDealId && dealId.toString() === activeDealId) {
+          addMsg("agent", "Farmi 🤖", `Deal accepted at ${price.toString()} / 100kg. Fund the escrow to proceed.`);
+          showFundButton();
+        }
+      });
+
+      market.on("EscrowFunded", (dealId) => {
+        if (activeDealId && dealId.toString() === activeDealId)
+          addMsg("system", "", "Escrow funded. The farmer can now ship via an approved courier.");
+      });
+    }
+
+    function showFundButton() {
+      if (document.getElementById("fundBtn")) return;
+      const b = document.createElement("button");
+      b.id = "fundBtn"; b.className = "btn"; b.style.marginTop = "10px";
+      b.textContent = "Fund escrow for deal #" + activeDealId;
+      b.onclick = async () => {
+        try {
+          // NOTE: amount source is an open question (see chat). Funding 0 here is a placeholder —
+          // the contract should expose the required ETH (e.g. deals[id].escrowAmount) to send as msg.value.
+          setStatus(negoStatus, "Funding escrow… (wire up msg.value to the deal's escrowAmount)");
+          const tx = await market.fundEscrow(activeDealId, { value: 0 });
+          await tx.wait();
+          setStatus(negoStatus, "Escrow funded.");
+        } catch (e) { setStatus(negoStatus, "Fund error: " + (e.message || e), true); }
+      };
+      $("negoPanel").appendChild(b);
+    }
+
+    function addMsg(kind, who, text) {
+      const el = document.createElement("div");
+      el.className = "msg " + kind;
+      el.innerHTML = (who ? `<span class="who">${who}</span>` : "") + text;
+      const t = $("thread");
+      t.appendChild(el);
+      t.scrollTop = t.scrollHeight;
+    }
+  </script>
+</body>
+</html>
