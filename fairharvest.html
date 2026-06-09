@@ -298,7 +298,7 @@
       try {
         const [price, ts] = await oracle.getPrice();
         oraclePrice = price;
-        $("oraclePrice").textContent = price.toString() + " / 100kg";
+        $("oraclePrice").textContent = (price/1000000).toString() + " / 1kg";
         const ageMin = Math.max(0, Math.round((Date.now() / 1000 - Number(ts)) / 60));
         $("oracleAge").textContent = `(updated ${ageMin} min ago)`;
         // refresh floor prices already on screen
@@ -312,7 +312,7 @@
       const ratio = Number(el.getAttribute("data-floor")); // minPriceRatio, e.g. 90
       if (oraclePrice && ratio) {
         const floor = oraclePrice.mul(ratio).div(100);
-        el.textContent = floor.toString() + " / 100kg";
+        el.textContent = floor.toString() + " / 1kg";
       } else {
         el.textContent = ratio ? `${ratio}% of oracle` : "—";
       }
@@ -439,7 +439,7 @@
       market.on("CounterOffered", (dealId, price, round, by) => {
         if (activeDealId && dealId.toString() === activeDealId) {
           const fromAgent = !account || by.toLowerCase() !== account.toLowerCase();
-          if (fromAgent) addMsg("agent", "Farmi 🤖", `Counter-offer: ${price.toString()} / 100kg  (round ${round})`);
+          if (fromAgent) addMsg("agent", "Farmi 🤖", `Counter-offer: ${price.toString()} / 1kg  (round ${round})`);
         }
       });
 
