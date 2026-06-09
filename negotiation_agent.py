@@ -5,13 +5,19 @@ Polls the Sepolia TradeContract for OfferSubmitted / CounterOffered events and
 responds with counterOffer() or acceptDeal() transactions, bounded by the
 farmer's on-chain policy and the oracle price.
 
+When the buyer's offer meets the policy floor and rounds remain, the decision
+to accept or push for a better price is delegated to an LLM (Claude). All hard
+policy constraints (floor price, round limit) are enforced by the agent itself
+before and after the LLM call — the LLM cannot override them.
+
 Required environment variables (see .env.example):
     INFURA_TOKEN, WALLET_PRIVATE_KEY, FARMER_ADDRESS,
-    TRADE_CONTRACT_ADDRESS, ORACLE_CONTRACT_ADDRESS
+    TRADE_CONTRACT_ADDRESS, ORACLE_CONTRACT_ADDRESS, ANTHROPIC_API_KEY
 
 Optional:
     POLL_INTERVAL   — seconds between block polls (default 30)
-    TARGET_RATIO    — agent's opening counter as % of oracle price (default 95)
+    TARGET_RATIO    — fallback counter as % of oracle price if LLM unavailable (default 95)
+    LLM_MODEL       — Claude model ID to use for decisions (default claude-haiku-4-5-20251001)
 """
 
 import logging
@@ -19,6 +25,10 @@ import os
 import time
 from dataclasses import dataclass
 from enum import IntEnum
+
+import json
+import re
+import subprocess
 
 from dotenv import load_dotenv
 from web3 import Web3, HTTPProvider
@@ -50,6 +60,7 @@ GAS_BUFFER_RATIO: float = 1.20      # multiplied against estimated gas
 
 DEFAULT_TARGET_RATIO: int = 95
 DEFAULT_POLL_INTERVAL: int = 30
+DEFAULT_LLM_MODEL: str = "claude-haiku-4-5-20251001"
 
 # ---------------------------------------------------------------------------
 # ABIs  (minimal — update signatures once contracts are compiled and deployed)
@@ -163,23 +174,24 @@ ORACLE_ABI = [
     {
         "inputs": [],
         "name": "getPrice",
-        "outputs": [{"name": "", "type": "uint256"}],
+        "outputs": [{"internalType": "uint256", "name": "price", "type": "uint256"},
+                    {"internalType": "uint256", "name": "timestamp", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function",
     },
     {
         "inputs": [],
         "name": "lastUpdated",
-        "outputs": [{"name": "", "type": "uint256"}],
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function",
     },
     {
         "anonymous": False,
         "inputs": [
-            {"indexed": False, "name": "oldPrice", "type": "uint256"},
-            {"indexed": False, "name": "newPrice", "type": "uint256"},
-            {"indexed": False, "name": "timestamp", "type": "uint256"},
+            {"indexed": True, "internalType": "uint256", "name": "oldPrice", "type": "uint256"},
+            {"indexed": True, "internalType": "uint256", "name": "newPrice", "type": "uint256"},
+            {"indexed": False, "internalType": "uint256", "name": "timestamp", "type": "uint256"},
         ],
         "name": "PriceUpdated",
         "type": "event",
@@ -245,7 +257,8 @@ class OracleClient:
             ContractLogicError: If the oracle price is stale (oracle enforces
                 a 2-hour freshness requirement internally).
         """
-        return self._contract.functions.getPrice().call()
+        price, _ = self._contract.functions.getPrice().call()
+        return price
 
     def verify_deviation(self, current_price: int) -> bool:
         """Verify current_price is within MAX_PRICE_DEVIATION of the previous update.
@@ -312,6 +325,7 @@ class NegotiationAgent:
         wallet,
         farmer_addr: str,
         target_ratio: int,
+        llm_model: str,
     ) -> None:
         """Initialize the negotiation agent.
 
@@ -321,7 +335,8 @@ class NegotiationAgent:
             oracle: Initialized OracleClient.
             wallet: web3 Account object for signing transactions.
             farmer_addr: Checksummed address of the farmer whose deals to manage.
-            target_ratio: Agent's opening counter as % of oracle price (e.g. 95).
+            target_ratio: Fallback counter as % of oracle price when LLM is unavailable.
+            llm_model: Claude model ID passed to `claude --model` for decisions.
         """
         self._w3 = w3
         self._trade = trade_contract
@@ -329,6 +344,7 @@ class NegotiationAgent:
         self._wallet = wallet
         self._farmer_addr = farmer_addr
         self._target_ratio = target_ratio
+        self._llm_model = llm_model
         # deal_id → block timestamp of the original OfferSubmitted event.
         # Lets the agent pre-check the 2h negotiation timeout before spending gas.
         self._offer_timestamps: dict[int, int] = {}
@@ -452,7 +468,13 @@ class NegotiationAgent:
         policy: FarmerPolicy,
         oracle_price: int,
     ) -> tuple[str, int]:
-        """Apply rule-based decision for a given offer price and negotiation state.
+        """Apply policy guardrails then delegate to the LLM for strategic choices.
+
+        Hard rules (LLM cannot override):
+            - Offer below floor → must counter (or walk away if rounds exhausted).
+            - Round limit reached with acceptable offer → must accept.
+        Soft rule (LLM decides):
+            - Offer meets floor AND rounds remain → accept now or push for more?
 
         Args:
             deal_id: On-chain deal identifier (used only for logging).
@@ -462,28 +484,150 @@ class NegotiationAgent:
             oracle_price: Latest verified oracle price.
 
         Returns:
-            Tuple of (action, price) where:
-                action is "accept", "counter", or "walk_away".
-                price is the counter value for "counter"; 0 otherwise.
+            Tuple of (action, price) where action is "accept", "counter", or
+            "walk_away", and price is the counter value (0 for non-counter actions).
         """
         floor_price = policy.min_price_ratio * oracle_price // 100
-        target_price = max(self._target_ratio * oracle_price // 100, floor_price)
 
         logger.info(
             f"[deal {deal_id}] round={deal_round} offer={offer_price} "
-            f"floor={floor_price} target={target_price} oracle={oracle_price}"
+            f"floor={floor_price} oracle={oracle_price}"
         )
 
-        if deal_round >= policy.max_rounds:
-            logger.info(f"[deal {deal_id}] Round limit reached — walking away.")
-            return ("walk_away", 0)
+        if offer_price < floor_price:
+            if deal_round >= policy.max_rounds:
+                logger.info(f"[deal {deal_id}] Below floor at round limit — walking away.")
+                return ("walk_away", 0)
+            target = max(self._target_ratio * oracle_price // 100, floor_price)
+            logger.info(f"[deal {deal_id}] Below floor — countering at {target}.")
+            return ("counter", target)
 
-        if offer_price >= floor_price:
-            logger.info(f"[deal {deal_id}] Offer meets floor — accepting at {offer_price}.")
+        if deal_round >= policy.max_rounds:
+            logger.info(
+                f"[deal {deal_id}] Round limit reached, offer acceptable — accepting at {offer_price}."
+            )
             return ("accept", 0)
 
-        logger.info(f"[deal {deal_id}] Below floor — countering at {target_price}.")
-        return ("counter", target_price)
+        # Offer meets floor and rounds remain: let the LLM decide whether to
+        # accept now or try to push the price higher for the farmer.
+        return self._llm_decide(deal_id, offer_price, deal_round, policy, oracle_price)
+
+    def _llm_decide(
+        self,
+        deal_id: int,
+        offer_price: int,
+        deal_round: int,
+        policy: FarmerPolicy,
+        oracle_price: int,
+    ) -> tuple[str, int]:
+        """Ask the LLM whether to accept the offer or counter for a better price.
+
+        The LLM receives full negotiation context and responds via tool use to
+        guarantee structured output. The returned counter price is clamped within
+        valid bounds regardless of what the LLM suggests. Falls back to
+        _rule_based_fallback() on any API or parsing failure.
+
+        Args:
+            deal_id: On-chain deal identifier (used for logging).
+            offer_price: Buyer's current proposed price (already >= floor).
+            deal_round: Current negotiation round number.
+            policy: Farmer's on-chain policy.
+            oracle_price: Latest verified oracle price.
+
+        Returns:
+            Tuple of ("accept", 0) or ("counter", price).
+        """
+        floor_price = policy.min_price_ratio * oracle_price // 100
+        rounds_left = policy.max_rounds - deal_round
+        offer_pct = offer_price / oracle_price * 100
+
+        user_message = (
+            f"Negotiation context:\n"
+            f"  Oracle market price  : {oracle_price}\n"
+            f"  Buyer's current offer: {offer_price} ({offer_pct:.1f}% of market)\n"
+            f"  Farmer's floor price : {floor_price} ({policy.min_price_ratio}% of market)\n"
+            f"  Negotiation round    : {deal_round} of {policy.max_rounds}\n"
+            f"  Rounds remaining     : {rounds_left}\n\n"
+            f"The offer is above the farmer's minimum floor, so accepting is valid.\n"
+            f"You may also counter with a higher price to maximise the farmer's revenue.\n"
+            f"Any counter price must be strictly above {offer_price} and at most {oracle_price}.\n"
+            f"Caution: if you counter and the buyer does not respond, the deal expires "
+            f"after round {policy.max_rounds} with no sale — weigh this risk carefully."
+        )
+
+        try:
+            prompt = (
+                "You are a negotiation agent acting on behalf of a potato farmer. "
+                "Your sole objective is to maximise the farmer's sale price within "
+                "the policy constraints.\n\n"
+                f"{user_message}\n\n"
+                "Respond with ONLY a JSON object — no markdown, no extra text:\n"
+                '{"action": "accept" or "counter", '
+                '"counter_price": <integer, only include if action is counter>, '
+                '"reasoning": "<one sentence>"}'
+            )
+            cmd = ["claude", "-p", prompt]
+            if self._llm_model:
+                cmd += ["--model", self._llm_model]
+
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "claude -p exited non-zero")
+
+            raw = result.stdout.strip()
+            # Strip markdown code fences if the model wrapped the JSON anyway.
+            fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+            if fence_match:
+                raw = fence_match.group(1).strip()
+            json_start = raw.find("{")
+            json_end = raw.rfind("}")
+            if json_start == -1 or json_end == -1:
+                raise ValueError(f"No JSON object in output: {raw!r}")
+
+            decision = json.loads(raw[json_start : json_end + 1])
+            action: str = decision["action"]
+            reasoning: str = decision.get("reasoning", "")
+            logger.info(f"[deal {deal_id}] LLM: {action}. {reasoning}")
+
+            if action == "accept":
+                return ("accept", 0)
+
+            raw_counter: int = int(decision.get("counter_price", 0))
+            # Clamp: must beat the offer, respect floor, and not exceed oracle.
+            counter_price = max(raw_counter, offer_price + 1, floor_price)
+            counter_price = min(counter_price, oracle_price)
+            return ("counter", counter_price)
+
+        except Exception as exc:
+            logger.warning(
+                f"[deal {deal_id}] LLM call failed ({exc}) — falling back to rule-based."
+            )
+            return self._rule_based_fallback(offer_price, oracle_price, floor_price)
+
+    def _rule_based_fallback(
+        self, offer_price: int, oracle_price: int, floor_price: int
+    ) -> tuple[str, int]:
+        """Fallback decision when the LLM is unavailable.
+
+        Counters at target_ratio if that would beat the current offer; otherwise
+        accepts to avoid wasting a round on a pointless counter.
+
+        Args:
+            offer_price: Buyer's current proposed price.
+            oracle_price: Latest verified oracle price.
+            floor_price: Computed floor (minPriceRatio * oracle / 100).
+
+        Returns:
+            Tuple of ("accept", 0) or ("counter", price).
+        """
+        target = max(self._target_ratio * oracle_price // 100, floor_price)
+        if target > offer_price:
+            logger.info(f"Fallback: countering at {target}.")
+            return ("counter", target)
+        logger.info("Fallback: target not above offer — accepting.")
+        return ("accept", 0)
 
     # ── Transaction helpers ──────────────────────────────────────────────────
 
@@ -750,6 +894,7 @@ def _load_config() -> dict:
         "oracle_addr": Web3.to_checksum_address(os.environ["ORACLE_CONTRACT_ADDRESS"]),
         "poll_interval": int(os.environ.get("POLL_INTERVAL", DEFAULT_POLL_INTERVAL)),
         "target_ratio": int(os.environ.get("TARGET_RATIO", DEFAULT_TARGET_RATIO)),
+        "llm_model": os.environ.get("LLM_MODEL", DEFAULT_LLM_MODEL),
     }
 
 
@@ -777,6 +922,8 @@ def main() -> None:
     trade_contract = w3.eth.contract(address=config["trade_addr"], abi=TRADE_ABI)
     oracle_contract = w3.eth.contract(address=config["oracle_addr"], abi=ORACLE_ABI)
 
+    logger.info(f"LLM model: {config['llm_model']}")
+
     oracle = OracleClient(w3, oracle_contract)
     agent = NegotiationAgent(
         w3=w3,
@@ -785,6 +932,7 @@ def main() -> None:
         wallet=wallet,
         farmer_addr=config["farmer_addr"],
         target_ratio=config["target_ratio"],
+        llm_model=config["llm_model"],
     )
     agent.run(poll_interval=config["poll_interval"])
 
