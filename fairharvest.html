@@ -415,7 +415,7 @@
           setStatus(negoStatus, "Sending counter-offer…");
           tx = await market.counterOffer(activeDealId, price);
         }
-        addMsg("buyer", "You", `Offer: ${price} / 100kg  ·  ${qty} kg`);
+        addMsg("buyer", "You", `Offer: ${price} / 1kg  ·  ${qty} kg`);
         setStatus(negoStatus, "Tx sent: " + tx.hash.slice(0, 10) + "… waiting for confirmation.");
         await tx.wait();
         setStatus(negoStatus, "On-chain. Waiting for the agent to respond…");
@@ -445,7 +445,7 @@
 
       market.on("DealAccepted", (dealId, price) => {
         if (activeDealId && dealId.toString() === activeDealId) {
-          addMsg("agent", "Farmi 🤖", `Deal accepted at ${price.toString()} / 100kg. Fund the escrow to proceed.`);
+          addMsg("agent", "Farmi 🤖", `Deal accepted at ${price.toString()} / 1kg. Fund the escrow to proceed.`);
           showFundButton();
         }
       });
