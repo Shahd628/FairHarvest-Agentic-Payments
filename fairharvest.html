@@ -252,11 +252,16 @@
 
     async function connectWallet() {
       try {
-        if (!window.ethereum) { setStatus(walletStatus, "MetaMask not found.", true); return; }
-        provider = new ethers.providers.Web3Provider(window.ethereum);
-        await provider.send("eth_requestAccounts", []);
+        if (typeof window.ethereum === 'undefined') {
+          setStatus(walletStatus, "MetaMask not found. Please install it from metamask.io", true);
+          return;
+        }
+
+        await window.ethereum.request({ method: "eth_requestAccounts" });
+        provider = new ethers.providers.Web3Provider(window.ethereum, "any");
         signer = provider.getSigner();
         account = await signer.getAddress();
+        
         const net = await provider.getNetwork();
         $("account").textContent = account;
         $("network").textContent = `${net.name} (chainId ${net.chainId})`;
