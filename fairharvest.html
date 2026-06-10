@@ -160,7 +160,16 @@
       </div>
     </section>
 
-    <!-- 3. Negotiation (handoff to the agent) -->
+    <!-- 3. Active Deals -->
+    <section class="panel">
+      <h2>Active Deals</h2>
+      <button class="btn secondary" id="loadDealsBtn">Refresh Deals</button>
+      <div id="dealsList" style="margin-top:14px">
+        <div class="empty">Click refresh to load deals.</div>
+      </div>
+    </section>
+
+    <!-- 4. Negotiation (handoff to the agent) -->
     <section class="panel hidden" id="negoPanel">
       <div class="nego-head">
         <h2 style="margin:0">Negotiate with Farmi 🤖</h2>
@@ -176,8 +185,8 @@
 
       <div class="offer-form">
         <div>
-          <label for="offerPrice">Your price (per 100&nbsp;kg)</label>
-          <input id="offerPrice" type="number" min="0" step="1" placeholder="e.g. 2500" />
+          <label for="offerPrice">Your price (per 1&nbsp;kg)</label>
+          <input id="offerPrice" type="number" min="0" step="0.01" placeholder="e.g. 5.20" />
         </div>
         <div>
           <label for="offerQty">Quantity (kg)</label>
@@ -203,20 +212,22 @@
     const MARKET_ABI = [
       // --- events used to discover farmers and follow negotiations ---
       // ASSUMED: registerPolicy emits this so buyers can enumerate farmers (doc relies on event logs)
-      "event PolicyRegistered(address indexed farmer, uint256 minPriceRatio, uint256 maxDealSize, uint256 maxRounds, uint256 maxConcurrentDeals)",
+      "event FarmerRegistered(address indexed farmer)",
       "event OfferSubmitted(uint256 indexed dealId, address indexed buyer, address indexed farmer, uint256 price, uint256 quantity)",
-      "event CounterOffered(uint256 indexed dealId, uint256 price, uint8 round, address by)",
+      "event CounterOffered(uint256 indexed dealId, address indexed caller, uint256 price, uint8 round)",
       "event DealAccepted(uint256 indexed dealId, uint256 price)",
       "event EscrowFunded(uint256 indexed dealId, uint256 amount)",
       // --- reads ---
       // public mapping getter for FarmerPolicy struct (order per design doc)
-      "function policies(address) view returns (uint256 minPriceRatio, uint256 maxDealSize, uint256 maxRounds, uint256 maxConcurrentDeals, bool isRegistered)",
+      "function policies(address) view returns (uint256 minPriceRatio, uint256 maxDealSize, uint256 maxRounds, bool isRegistered)",
       // --- writes a buyer needs ---
       "function submitOffer(address farmer, uint256 price, uint256 quantity) returns (uint256)",
       "function counterOffer(uint256 dealId, uint256 price)",
       "function acceptDeal(uint256 dealId)",
-      "function fundEscrow(uint256 dealId) payable"
-    ];
+      "function fundEscrow(uint256 dealId) payable",
+
+      "function nextDealId() view returns (uint256)",
+      "function deals(uint256) view returns (address farmer, address buyer, uint256 agreedPrice, uint256 quantity, uint256 dealTimestamp, uint256 escrowAmount, uint8 round, uint8 state, string trackingUrl, bool farmerSigned, bool buyerSigned)",    ];
 
     // ASSUMED: oracle getPrice returns (price, timestamp); reverts if stale (>2h) per design
     const ORACLE_ABI = [
@@ -224,8 +235,8 @@
     ];
 
     // Block to start scanning logs from (set to your deploy block to keep it fast).
-    const DEPLOY_BLOCK = 0;
-    const CHUNK = 5000;
+    const DEPLOY_BLOCK = 11025176;
+    const CHUNK = 2000;
 
     /* ===================================================================== */
 
@@ -244,6 +255,53 @@
     $("loadBtn").onclick = loadContracts;
     $("sendOfferBtn").onclick = sendOffer;
     $("closeNego").onclick = closeNego;
+
+    $("loadDealsBtn").onclick = loadDeals;
+
+    const DEAL_STATES = ["Negotiating", "Funded", "Shipped", "Disputed", "Complete", "Refunded"];
+
+    async function loadDeals() {
+      const container = $("dealsList");
+      container.innerHTML = '<div class="empty">Loading…</div>';
+      
+      try {
+        const total = await market.nextDealId();
+        const count = total.toNumber();
+        
+        if (count === 0) {
+          container.innerHTML = '<div class="empty">No deals yet.</div>';
+          return;
+        }
+
+        container.innerHTML = "";
+        for (let i = count - 1; i >= 0; i--) {
+          const d = await market.deals(i);
+          const state = DEAL_STATES[d.state] || "Unknown";
+          const price = (d.agreedPrice / 1000000).toFixed(2);
+          const farmerShort = d.farmer.slice(0,6) + "…" + d.farmer.slice(-4);
+          const buyerShort  = d.buyer.slice(0,6)  + "…" + d.buyer.slice(-4);
+
+          const card = document.createElement("div");
+          card.className = "card";
+          card.style.marginBottom = "10px";
+          card.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span class="crop" style="font-size:15px">Deal #${i}</span>
+              <span class="chip">${state}</span>
+            </div>
+            <div class="stat-row"><span>Farmer</span><span class="mono">${farmerShort}</span></div>
+            <div class="stat-row"><span>Buyer</span><span class="mono">${buyerShort}</span></div>
+            <div class="stat-row"><span>Price</span><span>${price} TL/kg</span></div>
+            <div class="stat-row"><span>Quantity</span><span>${d.quantity} kg</span></div>
+            <div class="stat-row"><span>Round</span><span>${d.round}</span></div>
+            <div class="stat-row"><span>Escrow</span><span>${ethers.utils.formatEther(d.escrowAmount)} ETH</span></div>
+          `;
+          container.appendChild(card);
+        }
+      } catch(e) {
+        container.innerHTML = `<div class="empty" style="color:red">Error: ${e.message}</div>`;
+      }
+    }
 
     function setStatus(el, msg, isErr) {
       el.textContent = msg;
@@ -298,7 +356,7 @@
       try {
         const [price, ts] = await oracle.getPrice();
         oraclePrice = price;
-        $("oraclePrice").textContent = price.toString() + " / 100kg";
+        $("oraclePrice").textContent = (price/1000000).toString() + " / 1kg";
         const ageMin = Math.max(0, Math.round((Date.now() / 1000 - Number(ts)) / 60));
         $("oracleAge").textContent = `(updated ${ageMin} min ago)`;
         // refresh floor prices already on screen
@@ -312,13 +370,13 @@
       const ratio = Number(el.getAttribute("data-floor")); // minPriceRatio, e.g. 90
       if (oraclePrice && ratio) {
         const floor = oraclePrice.mul(ratio).div(100);
-        el.textContent = floor.toString() + " / 100kg";
+        el.textContent = (floor / 1000000).toFixed(2) + " TL / kg";
       } else {
         el.textContent = ratio ? `${ratio}% of oracle` : "—";
       }
     }
 
-    // --- Discover farmers from PolicyRegistered logs, de-duped to latest policy ---
+    // --- Discover farmers from FarmerRegistered logs, de-duped to latest policy ---
     async function loadListings() {
       const container = $("listings");
       container.innerHTML = '<div class="empty">Scanning event logs…</div>';
@@ -329,25 +387,26 @@
       while (from <= latest) {
         const to = Math.min(from + CHUNK - 1, latest);
         try {
-          const batch = await market.queryFilter(market.filters.PolicyRegistered(), from, to);
+          const batch = await market.queryFilter(market.filters.FarmerRegistered(), from, to);
           events.push(...batch);
         } catch (_) { /* range with no logs / provider hiccup — keep going */ }
         from = to + 1;
       }
 
       // latest policy per farmer wins
-      const byFarmer = new Map();
-      for (const ev of events) {
-        const a = ev.args;
-        byFarmer.set(a.farmer.toLowerCase(), {
-          farmer: a.farmer,
-          minPriceRatio: a.minPriceRatio.toString(),
-          maxDealSize: a.maxDealSize.toString(),
-          maxRounds: a.maxRounds.toString(),
-          maxConcurrentDeals: a.maxConcurrentDeals ? a.maxConcurrentDeals.toString() : "—",
-          block: ev.blockNumber
-        });
-      }
+     const byFarmer = new Map();
+     for (const ev of events) {
+      const farmerAddr = ev.args.farmer;
+      const policy = await market.policies(farmerAddr);
+      byFarmer.set(farmerAddr.toLowerCase(), {
+        farmer: farmerAddr,
+        minPriceRatio: policy.minPriceRatio.toString(),
+        maxDealSize: policy.maxDealSize.toString(),
+        maxRounds: policy.maxRounds.toString(),
+        block: ev.blockNumber
+      });
+     }
+    
 
       const farmers = [...byFarmer.values()].sort((x, y) => y.block - x.block);
       if (!farmers.length) {
@@ -399,23 +458,25 @@
       activeFarmer = null; activeDealId = null;
     }
 
-    async function sendOffer() {
+   async function sendOffer() {
       try {
         if (!market || !activeFarmer) { setStatus(negoStatus, "Open a listing first.", true); return; }
-        const price = $("offerPrice").value.trim();
+        const priceInput = $("offerPrice").value.trim();
         const qty = $("offerQty").value.trim();
-        if (!price || !qty) { setStatus(negoStatus, "Enter price and quantity.", true); return; }
+        if (!priceInput || !qty) { setStatus(negoStatus, "Enter price and quantity.", true); return; }
 
-        // First message in a thread = submitOffer; subsequent buyer messages = counterOffer
+        // User types human price (e.g. 5.2), contract expects scaled ×1e6
+        const priceScaled = Math.round(parseFloat(priceInput) * 1_000_000);
+
         let tx;
         if (activeDealId === null) {
           setStatus(negoStatus, "Submitting offer on-chain…");
-          tx = await market.submitOffer(activeFarmer, price, qty);
+          tx = await market.submitOffer(activeFarmer, priceScaled, qty);
         } else {
           setStatus(negoStatus, "Sending counter-offer…");
-          tx = await market.counterOffer(activeDealId, price);
+          tx = await market.counterOffer(activeDealId, priceScaled);
         }
-        addMsg("buyer", "You", `Offer: ${price} / 100kg  ·  ${qty} kg`);
+        addMsg("buyer", "You", `Offer: ${parseFloat(priceInput).toFixed(2)} TL/kg · ${qty} kg`);
         setStatus(negoStatus, "Tx sent: " + tx.hash.slice(0, 10) + "… waiting for confirmation.");
         await tx.wait();
         setStatus(negoStatus, "On-chain. Waiting for the agent to respond…");
@@ -436,16 +497,16 @@
         }
       });
 
-      market.on("CounterOffered", (dealId, price, round, by) => {
+      market.on("CounterOffered", (dealId, caller, price, round) => {
         if (activeDealId && dealId.toString() === activeDealId) {
           const fromAgent = !account || by.toLowerCase() !== account.toLowerCase();
-          if (fromAgent) addMsg("agent", "Farmi 🤖", `Counter-offer: ${price.toString()} / 100kg  (round ${round})`);
+          if (fromAgent) addMsg("agent", "Farmi 🤖", `Counter-offer: ${(price/1000000).toFixed(2)} / 1kg  (round ${round})`);
         }
       });
 
       market.on("DealAccepted", (dealId, price) => {
         if (activeDealId && dealId.toString() === activeDealId) {
-          addMsg("agent", "Farmi 🤖", `Deal accepted at ${price.toString()} / 100kg. Fund the escrow to proceed.`);
+          addMsg("agent", "Farmi 🤖", `Deal accepted at ${(price/1000000).toFixed(2)} / 1kg. Fund the escrow to proceed.`);
           showFundButton();
         }
       });
