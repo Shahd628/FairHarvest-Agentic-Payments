@@ -177,7 +177,7 @@
       <div class="offer-form">
         <div>
           <label for="offerPrice">Your price (per 1&nbsp;kg)</label>
-          <input id="offerPrice" type="number" min="0" step="1" placeholder="e.g. 2500" />
+          <input id="offerPrice" type="number" min="0" step="0.01" placeholder="e.g. 5.20" />
         </div>
         <div>
           <label for="offerQty">Quantity (kg)</label>
@@ -399,23 +399,25 @@
       activeFarmer = null; activeDealId = null;
     }
 
-    async function sendOffer() {
+   async function sendOffer() {
       try {
         if (!market || !activeFarmer) { setStatus(negoStatus, "Open a listing first.", true); return; }
-        const price = $("offerPrice").value.trim();
+        const priceInput = $("offerPrice").value.trim();
         const qty = $("offerQty").value.trim();
-        if (!price || !qty) { setStatus(negoStatus, "Enter price and quantity.", true); return; }
+        if (!priceInput || !qty) { setStatus(negoStatus, "Enter price and quantity.", true); return; }
 
-        // First message in a thread = submitOffer; subsequent buyer messages = counterOffer
+        // User types human price (e.g. 5.2), contract expects scaled ×1e6
+        const priceScaled = Math.round(parseFloat(priceInput) * 1_000_000);
+
         let tx;
         if (activeDealId === null) {
           setStatus(negoStatus, "Submitting offer on-chain…");
-          tx = await market.submitOffer(activeFarmer, price, qty);
+          tx = await market.submitOffer(activeFarmer, priceScaled, qty);
         } else {
           setStatus(negoStatus, "Sending counter-offer…");
-          tx = await market.counterOffer(activeDealId, price);
+          tx = await market.counterOffer(activeDealId, priceScaled);
         }
-        addMsg("buyer", "You", `Offer: ${(price/1000000).toFixed(2)} / 1kg  ·  ${qty} kg`);
+        addMsg("buyer", "You", `Offer: ${parseFloat(priceInput).toFixed(2)} TL/kg · ${qty} kg`);
         setStatus(negoStatus, "Tx sent: " + tx.hash.slice(0, 10) + "… waiting for confirmation.");
         await tx.wait();
         setStatus(negoStatus, "On-chain. Waiting for the agent to respond…");
