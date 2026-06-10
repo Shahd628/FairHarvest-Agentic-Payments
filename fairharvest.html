@@ -176,7 +176,7 @@
 
       <div class="offer-form">
         <div>
-          <label for="offerPrice">Your price (per 100&nbsp;kg)</label>
+          <label for="offerPrice">Your price (per 1&nbsp;kg)</label>
           <input id="offerPrice" type="number" min="0" step="1" placeholder="e.g. 2500" />
         </div>
         <div>
@@ -210,7 +210,7 @@
       "event EscrowFunded(uint256 indexed dealId, uint256 amount)",
       // --- reads ---
       // public mapping getter for FarmerPolicy struct (order per design doc)
-      "function policies(address) view returns (uint256 minPriceRatio, uint256 maxDealSize, uint256 maxRounds, uint256 maxConcurrentDeals, bool isRegistered)",
+      "function policies(address) view returns (uint256 minPriceRatio, uint256 maxDealSize, uint256 maxRounds, bool isRegistered)",
       // --- writes a buyer needs ---
       "function submitOffer(address farmer, uint256 price, uint256 quantity) returns (uint256)",
       "function counterOffer(uint256 dealId, uint256 price)",
@@ -224,8 +224,8 @@
     ];
 
     // Block to start scanning logs from (set to your deploy block to keep it fast).
-    const DEPLOY_BLOCK = 0;
-    const CHUNK = 5000;
+    const DEPLOY_BLOCK = 11025176;
+    const CHUNK = 2000;
 
     /* ===================================================================== */
 
@@ -312,7 +312,7 @@
       const ratio = Number(el.getAttribute("data-floor")); // minPriceRatio, e.g. 90
       if (oraclePrice && ratio) {
         const floor = oraclePrice.mul(ratio).div(100);
-        el.textContent = floor.toString() + " / 1kg";
+        el.textContent = (floor / 1000000).toFixed(2) + " TL / kg";
       } else {
         el.textContent = ratio ? `${ratio}% of oracle` : "—";
       }
@@ -345,7 +345,6 @@
         minPriceRatio: policy.minPriceRatio.toString(),
         maxDealSize: policy.maxDealSize.toString(),
         maxRounds: policy.maxRounds.toString(),
-        maxConcurrentDeals: "—",
         block: ev.blockNumber
       });
      }
@@ -416,7 +415,7 @@
           setStatus(negoStatus, "Sending counter-offer…");
           tx = await market.counterOffer(activeDealId, price);
         }
-        addMsg("buyer", "You", `Offer: ${price} / 1kg  ·  ${qty} kg`);
+        addMsg("buyer", "You", `Offer: ${(price/1000000).toFixed(2)} / 1kg  ·  ${qty} kg`);
         setStatus(negoStatus, "Tx sent: " + tx.hash.slice(0, 10) + "… waiting for confirmation.");
         await tx.wait();
         setStatus(negoStatus, "On-chain. Waiting for the agent to respond…");
@@ -440,13 +439,13 @@
       market.on("CounterOffered", (dealId, price, round, by) => {
         if (activeDealId && dealId.toString() === activeDealId) {
           const fromAgent = !account || by.toLowerCase() !== account.toLowerCase();
-          if (fromAgent) addMsg("agent", "Farmi 🤖", `Counter-offer: ${price.toString()} / 1kg  (round ${round})`);
+          if (fromAgent) addMsg("agent", "Farmi 🤖", `Counter-offer: ${(price/1000000).toFixed(2)} / 1kg  (round ${round})`);
         }
       });
 
       market.on("DealAccepted", (dealId, price) => {
         if (activeDealId && dealId.toString() === activeDealId) {
-          addMsg("agent", "Farmi 🤖", `Deal accepted at ${price.toString()} / 1kg. Fund the escrow to proceed.`);
+          addMsg("agent", "Farmi 🤖", `Deal accepted at ${(price/1000000).toFixed(2)} / 1kg. Fund the escrow to proceed.`);
           showFundButton();
         }
       });
