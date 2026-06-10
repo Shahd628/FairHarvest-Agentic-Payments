@@ -12,7 +12,7 @@ before and after the LLM call — the LLM cannot override them.
 
 Required environment variables (see .env.example):
     INFURA_TOKEN, WALLET_PRIVATE_KEY, FARMER_ADDRESS,
-    TRADE_CONTRACT_ADDRESS, ORACLE_CONTRACT_ADDRESS, ANTHROPIC_API_KEY
+    TRADE_CONTRACT_ADDRESS, ORACLE_CONTRACT_ADDRESS
 
 Optional:
     POLL_INTERVAL   — seconds between block polls (default 30)
@@ -22,19 +22,21 @@ Optional:
 
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass
 from enum import IntEnum
 
 import json
 import re
+import shutil
 import subprocess
 
 from dotenv import load_dotenv
 from web3 import Web3, HTTPProvider
-from web3.exceptions import ContractLogicError
+from web3.exceptions import ContractLogicError, TimeExhausted
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -54,16 +56,17 @@ logger = logging.getLogger(__name__)
 SEPOLIA_CHAIN_ID: int = 11_155_111
 MAX_PRICE_DEVIATION: float = 0.20   # mirrors oracle contract's 20% single-step cap
 NEGOTIATION_TIMEOUT: int = 7_200    # seconds — contract also enforces this via revert
-LOG_LOOKBACK_BLOCKS: int = 10_000   # ~33 hours at 12s/block; used for oracle event scan
+LOG_LOOKBACK_BLOCKS: int = 20_000   # ~66 hours at 12s/block; used for oracle startup event scan
 EVENT_CHUNK_SIZE: int = 2_000       # max blocks per eth_getLogs call (Infura limit)
 GAS_BUFFER_RATIO: float = 1.20      # multiplied against estimated gas
+STATE_FILE: str = "agent_state.json"   # persists last processed block across restarts
 
 DEFAULT_TARGET_RATIO: int = 95
 DEFAULT_POLL_INTERVAL: int = 30
 DEFAULT_LLM_MODEL: str = "claude-haiku-4-5-20251001"
 
 # ---------------------------------------------------------------------------
-# ABIs  (minimal — update signatures once contracts are compiled and deployed)
+# ABIs
 # ---------------------------------------------------------------------------
 
 TRADE_ABI = [
@@ -113,6 +116,14 @@ TRADE_ABI = [
         "inputs": [{"name": "buyer", "type": "address"}],
         "name": "platformBlacklist",
         "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    # --- negotiation bookkeeping ---
+    {
+        "inputs": [{"name": "dealId", "type": "uint256"}],
+        "name": "offerStartedAt",
+        "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function",
     },
@@ -174,15 +185,32 @@ ORACLE_ABI = [
     {
         "inputs": [],
         "name": "getPrice",
-        "outputs": [{"internalType": "uint256", "name": "price", "type": "uint256"},
-                    {"internalType": "uint256", "name": "timestamp", "type": "uint256"}],
+        "outputs": [{"name": "price", "type": "uint256"},
+                    {"name": "timestamp", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        # Skips the 2-hour staleness revert — safe for off-chain reads only.
+        # Agent falls back to this when getPrice() reverts due to stale data.
+        "inputs": [],
+        "name": "getPriceUnsafe",
+        "outputs": [{"name": "price", "type": "uint256"},
+                    {"name": "timestamp", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "stalenessCheckEnabled",
+        "outputs": [{"name": "", "type": "bool"}],
         "stateMutability": "view",
         "type": "function",
     },
     {
         "inputs": [],
         "name": "lastUpdated",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function",
     },
@@ -197,6 +225,43 @@ ORACLE_ABI = [
         "type": "event",
     },
 ]
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _find_claude_cli() -> list[str]:
+    """Return the subprocess command prefix to invoke the claude CLI.
+
+    Checks (in order):
+    1. CLAUDE_CLI_PATH env var — explicit override, useful when PATH is stale.
+    2. shutil.which("claude") — searches the current process PATH.
+    3. Common Windows npm global bin — %APPDATA%\\npm\\claude.cmd — covers the
+       case where VS Code was launched before Claude Code updated PATH.
+
+    On Windows the returned list wraps the binary in ["cmd", "/c", <path>] so
+    that .cmd files execute correctly without shell=True.
+    """
+    explicit = os.environ.get("CLAUDE_CLI_PATH")
+    if explicit:
+        claude: str | None = explicit
+    else:
+        claude = shutil.which("claude")
+        if claude is None and sys.platform == "win32":
+            npm_candidate = os.path.expandvars(r"%APPDATA%\npm\claude.cmd")
+            if os.path.isfile(npm_candidate):
+                claude = npm_candidate
+
+    if claude is None:
+        raise FileNotFoundError(
+            "claude CLI not found in PATH or %APPDATA%\\npm. "
+            "Install Claude Code or set CLAUDE_CLI_PATH=/full/path/to/claude in .env"
+        )
+
+    if sys.platform == "win32":
+        return ["cmd", "/c", claude]
+    return [claude]
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -248,17 +313,27 @@ class OracleClient:
         self._contract = contract
 
     def get_price(self) -> int:
-        """Call getPrice() on the oracle contract.
+        """Return the current oracle price.
+
+        Tries getPrice() first (enforces 2-hour staleness window). If that
+        reverts because the price is stale, falls back to getPriceUnsafe()
+        and logs a warning. To suppress the warning in testing, call
+        setStalenessCheck(false) via oracle_admin.py, or run the oracle
+        updater to push a fresh price.
 
         Returns:
-            Current commodity price (oracle precision units).
-
-        Raises:
-            ContractLogicError: If the oracle price is stale (oracle enforces
-                a 2-hour freshness requirement internally).
+            Current commodity price (oracle precision units ×1e6).
         """
-        price, _ = self._contract.functions.getPrice().call()
-        return price
+        try:
+            price, _ = self._contract.functions.getPrice().call()
+            return price
+        except ContractLogicError:
+            logger.warning(
+                "getPrice() reverted — oracle price is stale (staleness check enabled). "
+                "Using getPriceUnsafe() for now. Run: python oracle_admin.py disable-staleness"
+            )
+            price, _ = self._contract.functions.getPriceUnsafe().call()
+            return price
 
     def verify_deviation(self, current_price: int) -> bool:
         """Verify current_price is within MAX_PRICE_DEVIATION of the previous update.
@@ -277,7 +352,17 @@ class OracleClient:
         latest_block = self._w3.eth.block_number
         from_block = max(0, latest_block - LOG_LOOKBACK_BLOCKS)
 
-        logs = self._contract.events.PriceUpdated.get_logs(fromBlock=from_block)
+        # Chunk the scan so a large LOG_LOOKBACK_BLOCKS doesn't exceed Infura's
+        # 10k-block-per-eth_getLogs limit. Collects all events then uses the last.
+        logs = []
+        chunk_start = from_block
+        while chunk_start <= latest_block:
+            chunk_end = min(chunk_start + EVENT_CHUNK_SIZE - 1, latest_block)
+            logs.extend(self._contract.events.PriceUpdated.get_logs(
+                from_block=chunk_start, to_block=chunk_end
+            ))
+            chunk_start = chunk_end + 1
+
         if not logs:
             logger.warning("No PriceUpdated events found in lookback window — skipping deviation check.")
             return True
@@ -285,6 +370,10 @@ class OracleClient:
         last = logs[-1]
         old_price = last["args"]["oldPrice"]
         if old_price == 0:
+            logger.info(
+                f"Oracle history: {len(logs)} PriceUpdated event(s) found, "
+                f"last at block {last['blockNumber']} — first-ever update (oldPrice=0), skipping deviation check."
+            )
             return True
 
         deviation = abs(current_price - old_price) / old_price
@@ -295,6 +384,10 @@ class OracleClient:
             )
             return False
 
+        logger.info(
+            f"Oracle history: {len(logs)} PriceUpdated event(s) found, "
+            f"last at block {last['blockNumber']} — deviation {deviation:.2%} vs previous price. OK."
+        )
         return True
 
 
@@ -345,25 +438,33 @@ class NegotiationAgent:
         self._farmer_addr = farmer_addr
         self._target_ratio = target_ratio
         self._llm_model = llm_model
-        # deal_id → block timestamp of the original OfferSubmitted event.
-        # Lets the agent pre-check the 2h negotiation timeout before spending gas.
-        self._offer_timestamps: dict[int, int] = {}
+        # Last oracle price seen by this agent instance; used for cache-based
+        # deviation checks instead of a per-cycle PriceUpdated event scan.
+        self._last_oracle_price: int | None = None
+        # In-memory guard: deal IDs for which a tx was sent but not yet confirmed.
+        # Prevents duplicate sends when the same OfferSubmitted event is re-processed
+        # after a receipt timeout.
+        self._pending_deal_ids: set[int] = set()
 
     # ── Event polling ────────────────────────────────────────────────────────
 
     def poll_events(self, from_block: int, to_block: int) -> list:
         """Fetch OfferSubmitted and CounterOffered events in the given block range.
 
-        Queries in chunks of EVENT_CHUNK_SIZE to respect Infura's eth_getLogs
-        limit. OfferSubmitted is filtered server-side by the farmer's address.
-        Results are sorted by block number ascending.
+        Uses two separate get_logs calls per chunk (one per event type) so that
+        web3.py handles topic encoding and log decoding through its tested path.
+        OfferSubmitted is filtered server-side to this agent's farmer address via
+        argument_filters, so only relevant offers are returned.
+
+        Infura's 10k-block limit is respected via EVENT_CHUNK_SIZE; steady-state
+        polls cover a few new blocks per cycle (typically a single un-chunked call).
 
         Args:
             from_block: First block to include (inclusive).
             to_block: Last block to include (inclusive).
 
         Returns:
-            List of event log objects sorted by blockNumber ascending.
+            List of decoded event log objects sorted by (blockNumber, logIndex).
         """
         all_events: list = []
         chunk_start = from_block
@@ -371,20 +472,21 @@ class NegotiationAgent:
         while chunk_start <= to_block:
             chunk_end = min(chunk_start + EVENT_CHUNK_SIZE - 1, to_block)
 
-            offer_logs = self._trade.events.OfferSubmitted.get_logs(
-                fromBlock=chunk_start,
-                toBlock=chunk_end,
+            offer_logs = list(self._trade.events.OfferSubmitted.get_logs(
+                from_block=chunk_start,
+                to_block=chunk_end,
                 argument_filters={"farmer": self._farmer_addr},
-            )
-            counter_logs = self._trade.events.CounterOffered.get_logs(
-                fromBlock=chunk_start,
-                toBlock=chunk_end,
-            )
+            ))
+            counter_logs = list(self._trade.events.CounterOffered.get_logs(
+                from_block=chunk_start,
+                to_block=chunk_end,
+            ))
             all_events.extend(offer_logs)
             all_events.extend(counter_logs)
+
             chunk_start = chunk_end + 1
 
-        all_events.sort(key=lambda e: e["blockNumber"])
+        all_events.sort(key=lambda e: (e["blockNumber"], e["logIndex"]))
         return all_events
 
     # ── On-chain reads ───────────────────────────────────────────────────────
@@ -566,12 +668,12 @@ class NegotiationAgent:
                 '"counter_price": <integer, only include if action is counter>, '
                 '"reasoning": "<one sentence>"}'
             )
-            cmd = ["claude", "-p", prompt]
+            cmd = _find_claude_cli() + ["-p"]
             if self._llm_model:
                 cmd += ["--model", self._llm_model]
 
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=60
+                cmd, input=prompt, capture_output=True, text=True, timeout=60
             )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "claude -p exited non-zero")
@@ -649,18 +751,35 @@ class NegotiationAgent:
         nonce = self._w3.eth.get_transaction_count(self._wallet.address)
         gas_estimate = fn_call.estimate_gas({"from": self._wallet.address})
 
+        # EIP-1559 pricing — more reliable than legacy gasPrice on post-merge networks.
+        # maxFeePerGas = 2× current base fee + tip, so the tx survives a base-fee doubling.
+        latest_block = self._w3.eth.get_block("latest")
+        base_fee: int = latest_block.get("baseFeePerGas") or 0
+        max_priority_fee: int = Web3.to_wei(2, "gwei")
+        max_fee: int = base_fee * 2 + max_priority_fee
+
         tx = fn_call.build_transaction({
             "from": self._wallet.address,
             "nonce": nonce,
             "gas": int(gas_estimate * GAS_BUFFER_RATIO),
-            "gasPrice": self._w3.eth.gas_price,
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": max_priority_fee,
             "chainId": SEPOLIA_CHAIN_ID,
+            "type": 2,
         })
         signed = self._w3.eth.account.sign_transaction(tx, private_key=self._wallet.key)
         tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
         logger.info(f"Tx sent: {tx_hash.hex()} — awaiting confirmation...")
 
-        receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash)
+        try:
+            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+        except TimeExhausted:
+            logger.warning(
+                f"Receipt timeout for tx {tx_hash.hex()} after 300s — "
+                "tx is still in the mempool."
+            )
+            raise
+
         if receipt["status"] != 1:
             raise ContractLogicError(f"Transaction reverted: {tx_hash.hex()}")
 
@@ -715,19 +834,43 @@ class NegotiationAgent:
         buyer: str = args["buyer"]
         offer_price: int = args["price"]
 
-        block = self._w3.eth.get_block(event["blockNumber"])
-        self._offer_timestamps[deal_id] = block["timestamp"]
-
         logger.info(
             f"[deal {deal_id}] OfferSubmitted by {buyer} "
             f"at price={offer_price} qty={args['quantity']}"
         )
 
+        # Guard 1: in-memory check — tx was sent but receipt timed out last cycle.
+        if deal_id in self._pending_deal_ids:
+            logger.info(f"[deal {deal_id}] Tx still pending (sent last cycle) — skipping duplicate send.")
+            return
+
+        # Guard 2: on-chain check — a previous tx already confirmed and advanced the deal.
+        # deals() outputs: (farmer, buyer, agreedPrice, quantity, dealTimestamp, escrowAmount, round, state, ...)
+        deal_info = self._trade.functions.deals(deal_id).call()
+        on_chain_round: int = deal_info[6]
+        if on_chain_round > 0:
+            logger.info(f"[deal {deal_id}] Already at round {on_chain_round} on chain — skipping duplicate send.")
+            self._pending_deal_ids.discard(deal_id)
+            return
+
         if self.check_blacklists(buyer):
             return
 
         action, price = self.decide(deal_id, offer_price, 1, policy, oracle_price)
-        self._execute_action(deal_id, action, price)
+        self._pending_deal_ids.add(deal_id)
+        try:
+            self._execute_action(deal_id, action, price)
+        except TimeExhausted:
+            # Tx is in the mempool but unconfirmed after 300s (Sepolia issue).
+            # Keep deal_id in _pending_deal_ids so the next cycle skips re-sending.
+            # Guard 2 (round > 0) will clear it once the tx eventually mines.
+            logger.warning(f"[deal {deal_id}] Tx pending in mempool — guard active for next cycle.")
+            return
+        except Exception:
+            # Hard failure (ContractLogicError, RPC error, etc.) — no tx in flight.
+            self._pending_deal_ids.discard(deal_id)
+            raise
+        self._pending_deal_ids.discard(deal_id)
 
     def _handle_counter_offered(
         self, event, policy: FarmerPolicy, oracle_price: int
@@ -761,15 +904,14 @@ class NegotiationAgent:
             f"at price={offer_price} round={round_num}"
         )
 
-        offer_ts = self._offer_timestamps.get(deal_id)
-        if offer_ts is not None:
-            current_ts: int = self._w3.eth.get_block("latest")["timestamp"]
-            if current_ts - offer_ts >= NEGOTIATION_TIMEOUT:
-                logger.warning(
-                    f"[deal {deal_id}] Negotiation timeout exceeded "
-                    f"({current_ts - offer_ts}s elapsed) — walking away."
-                )
-                return
+        offer_started: int = self._trade.functions.offerStartedAt(deal_id).call()
+        current_ts: int = self._w3.eth.get_block("latest").get("timestamp", 0)
+        if current_ts - offer_started >= NEGOTIATION_TIMEOUT:
+            logger.warning(
+                f"[deal {deal_id}] Negotiation timeout exceeded "
+                f"({current_ts - offer_started}s elapsed) — walking away."
+            )
+            return
 
         action, price = self.decide(deal_id, offer_price, round_num, policy, oracle_price)
         self._execute_action(deal_id, action, price)
@@ -796,6 +938,41 @@ class NegotiationAgent:
         except ContractLogicError as exc:
             logger.error(f"[deal {deal_id}] Transaction reverted: {exc}")
 
+    # ── State persistence ────────────────────────────────────────────────────
+
+    def _load_state(self) -> int:
+        """Return the last processed block from the state file.
+
+        Falls back to TRADE_DEPLOY_BLOCK (if set) for a first-run history scan,
+        or to the current block if neither is available.
+
+        Returns:
+            Block number to use as the exclusive lower bound for the first poll.
+        """
+        try:
+            with open(STATE_FILE) as f:
+                data = json.load(f)
+                block = int(data["last_block"])
+                logger.info(f"Resuming from state file: last_block={block}")
+                return block
+        except (FileNotFoundError, KeyError, json.JSONDecodeError, ValueError):
+            pass
+
+        deploy_env = os.environ.get("TRADE_DEPLOY_BLOCK")
+        if deploy_env:
+            block = int(deploy_env)
+            logger.info(f"No state file — scanning from TRADE_DEPLOY_BLOCK={block}")
+            return block
+
+        block = self._w3.eth.block_number
+        logger.info(f"No state file or deploy block — starting from current block {block}")
+        return block
+
+    def _save_state(self, last_block: int) -> None:
+        """Persist last processed block so restarts resume without rescanning."""
+        with open(STATE_FILE, "w") as f:
+            json.dump({"last_block": last_block}, f)
+
     # ── Main loop ────────────────────────────────────────────────────────────
 
     def run(self, poll_interval: int) -> None:
@@ -808,12 +985,24 @@ class NegotiationAgent:
         Args:
             poll_interval: Seconds to sleep between poll cycles.
         """
-        last_block = self._w3.eth.block_number
+        last_block = self._load_state()
         logger.info(
             f"Agent started. Farmer={self._farmer_addr} "
             f"target_ratio={self._target_ratio}% "
             f"starting_block={last_block}"
         )
+
+        # One-time startup: establish baseline oracle price with full on-chain
+        # event-history verification. Subsequent cycles use cached comparison
+        # (zero extra RPC calls) instead of scanning PriceUpdated logs every tick.
+        try:
+            startup_price = self._oracle.get_price()
+            if not self._oracle.verify_deviation(startup_price):
+                logger.warning("Oracle deviation check failed on startup — proceeding with caution.")
+            self._last_oracle_price = startup_price
+            logger.info(f"Baseline oracle price: {startup_price}")
+        except ContractLogicError:
+            logger.warning("Oracle price stale on startup — baseline will be set on first live cycle.")
 
         while True:
             try:
@@ -832,11 +1021,19 @@ class NegotiationAgent:
                     time.sleep(poll_interval)
                     continue
 
-                if not self._oracle.verify_deviation(oracle_price):
-                    logger.error("Oracle deviation check failed — skipping cycle.")
-                    last_block = current_block
-                    time.sleep(poll_interval)
-                    continue
+                # Cache-based deviation check: avoids scanning PriceUpdated event
+                # history on every cycle. Only triggers when price actually changes.
+                if self._last_oracle_price is not None and oracle_price != self._last_oracle_price:
+                    deviation = abs(oracle_price - self._last_oracle_price) / self._last_oracle_price
+                    if deviation > MAX_PRICE_DEVIATION:
+                        logger.error(
+                            f"Oracle price moved {deviation:.1%} since last observation "
+                            f"(was {self._last_oracle_price}, now {oracle_price}) — skipping cycle."
+                        )
+                        last_block = current_block
+                        time.sleep(poll_interval)
+                        continue
+                self._last_oracle_price = oracle_price
 
                 events = self.poll_events(last_block + 1, current_block)
                 logger.info(
@@ -852,6 +1049,7 @@ class NegotiationAgent:
                         self._handle_counter_offered(event, policy, oracle_price)
 
                 last_block = current_block
+                self._save_state(last_block)
 
             except KeyboardInterrupt:
                 logger.info("Shutdown requested — agent stopping.")
@@ -908,7 +1106,14 @@ def main() -> None:
     config = _load_config()
 
     rpc_url = f"https://sepolia.infura.io/v3/{config['infura_token']}"
-    w3 = Web3(HTTPProvider(rpc_url))
+    # Disable HTTP keep-alive so the agent never holds a stale TCP connection
+    # across the poll-interval sleep. Infura's load balancer closes idle
+    # connections after ~30-60 s; "Connection: close" prevents the silent reuse
+    # of a dead socket on the next RPC call.
+    w3 = Web3(HTTPProvider(rpc_url, request_kwargs={
+        "timeout": 30,
+        "headers": {"Connection": "close"},
+    }))
     if not w3.is_connected():
         raise ConnectionError("Failed to connect to Sepolia via Infura.")
 
@@ -918,6 +1123,33 @@ def main() -> None:
         f"Agent wallet: {wallet.address} "
         f"({Web3.from_wei(balance, 'ether'):.6f} ETH)"
     )
+
+    # ── AUTH WARNING ────────────────────────────────────────────────────────
+    # FarmEscrow.counterOffer() and acceptDeal() require msg.sender == d.farmer
+    # or d.buyer.  The agent's wallet is neither unless WALLET_PRIVATE_KEY is
+    # the farmer's own key.  All transactions will revert until the contract is
+    # updated with an authorizedAgents mapping:
+    #
+    #   mapping(address => address) public authorizedAgents;
+    #
+    #   function setAgent(address agent) external {
+    #       require(policies[msg.sender].isRegistered, "not registered");
+    #       authorizedAgents[msg.sender] = agent;
+    #   }
+    #
+    # And counterOffer / acceptDeal check:
+    #   require(msg.sender == d.buyer || msg.sender == d.farmer
+    #           || msg.sender == authorizedAgents[d.farmer], "not a party");
+    #
+    # For testing: set WALLET_PRIVATE_KEY to the farmer's private key so that
+    # wallet.address == FARMER_ADDRESS.
+    if wallet.address.lower() != config["farmer_addr"].lower():
+        logger.warning(
+            "AGENT WALLET (%s) != FARMER ADDRESS (%s): counterOffer/acceptDeal "
+            "will revert — contract requires msg.sender to be the farmer. "
+            "See auth comment in main() for the required contract fix.",
+            wallet.address, config["farmer_addr"],
+        )
 
     trade_contract = w3.eth.contract(address=config["trade_addr"], abi=TRADE_ABI)
     oracle_contract = w3.eth.contract(address=config["oracle_addr"], abi=ORACLE_ABI)

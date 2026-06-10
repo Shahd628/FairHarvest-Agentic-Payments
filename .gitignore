@@ -6,3 +6,4 @@ venv/
 pyproject.toml
 uv.lock
 .python-version
+oracle_admin.py
