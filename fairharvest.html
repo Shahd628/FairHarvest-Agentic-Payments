@@ -296,11 +296,84 @@
             <div class="stat-row"><span>Round</span><span>${d.round}</span></div>
             <div class="stat-row"><span>Escrow</span><span>${ethers.utils.formatEther(d.escrowAmount)} ETH</span></div>
           `;
+          if (d.state === 0 && account && d.buyer.toLowerCase() === account.toLowerCase()) { // only show for your own deals
+            const continueBtn = document.createElement("button");
+            continueBtn.className = "btn secondary";
+            continueBtn.style.marginTop = "8px";
+            continueBtn.textContent = "Continue Negotiation";
+            continueBtn.onclick = () => {
+              activeDealId = i.toString();
+              activeFarmer = d.farmer;
+              $("negoFarmer").textContent = "farmer " + d.farmer.slice(0,6) + "…" + d.farmer.slice(-4);
+              $("thread").innerHTML = "";
+              $("negoPanel").classList.remove("hidden");
+              $("negoPanel").scrollIntoView({ behavior: "smooth" });
+              setStatus(negoStatus, "Reconnected to deal #" + i);
+              loadDealHistory(i);
+            };
+            card.appendChild(continueBtn);
+          }
           container.appendChild(card);
         }
       } catch(e) {
         container.innerHTML = `<div class="empty" style="color:red">Error: ${e.message}</div>`;
       }
+    }
+
+    async function loadDealHistory(dealId) {
+      addMsg("system", "", `Loading history for deal #${dealId}…`);
+      
+      const latest = await provider.getBlockNumber();
+      const from = DEPLOY_BLOCK;
+      const offerEvents = [];
+      const counterEvents = [];
+      const acceptEvents = [];
+
+      let start = from;
+      while (start <= latest) {
+        const end = Math.min(start + 2000 - 1, latest);
+        try {
+          const offers = await market.queryFilter(
+            market.filters.OfferSubmitted(dealId), start, end
+          );
+          const counters = await market.queryFilter(
+            market.filters.CounterOffered(dealId), start, end
+          );
+          const accepts = await market.queryFilter(
+            market.filters.DealAccepted(dealId), start, end
+          );
+          offerEvents.push(...offers);
+          counterEvents.push(...counters);
+          acceptEvents.push(...accepts);
+        } catch(_) {}
+        start = end + 1;
+      }
+
+      // merge and sort all events by block
+      const all = [...offerEvents, ...counterEvents, ...acceptEvents]
+        .sort((a, b) => a.blockNumber - b.blockNumber);
+
+      for (const ev of all) {
+        if (ev.event === "OfferSubmitted") {
+          const price = (ev.args.price / 1_000_000).toFixed(2);
+          const isMe = account && ev.args.buyer.toLowerCase() === account.toLowerCase();
+          addMsg("buyer", isMe ? "You" : "Buyer", `Offer: ${price} TL/kg · ${ev.args.quantity} kg`);
+        } else if (ev.event === "CounterOffered") {
+          const price = (ev.args.price / 1_000_000).toFixed(2);
+          const isMe = account && ev.args.caller.toLowerCase() === account.toLowerCase();
+          addMsg(
+            isMe ? "buyer" : "agent",
+            isMe ? "You" : "Farmi 🤖",
+            `Counter-offer: ${price} TL/kg (round ${ev.args.round})`
+          );
+        } else if (ev.event === "DealAccepted") {
+          const price = (ev.args.agreedPrice / 1_000_000).toFixed(2);
+          addMsg("agent", "Farmi 🤖", `Deal accepted at ${price} TL/kg. Fund the escrow to proceed.`);
+          showFundButton();
+        }
+      }
+
+      addMsg("system", "", "History loaded. You can continue from here.");
     }
 
     function setStatus(el, msg, isErr) {
@@ -458,14 +531,23 @@
       activeFarmer = null; activeDealId = null;
     }
 
-   async function sendOffer() {
+    async function sendOffer() {
       try {
         if (!market || !activeFarmer) { setStatus(negoStatus, "Open a listing first.", true); return; }
+        
+        // Check the connected wallet is the buyer of this deal
+        if (activeDealId !== null) {
+          const deal = await market.deals(activeDealId);
+          if (deal.buyer.toLowerCase() !== account.toLowerCase()) {
+            setStatus(negoStatus, "You are not the buyer of this deal.", true);
+            return;
+          }
+        }
+
         const priceInput = $("offerPrice").value.trim();
         const qty = $("offerQty").value.trim();
         if (!priceInput || !qty) { setStatus(negoStatus, "Enter price and quantity.", true); return; }
 
-        // User types human price (e.g. 5.2), contract expects scaled ×1e6
         const priceScaled = Math.round(parseFloat(priceInput) * 1_000_000);
 
         let tx;
