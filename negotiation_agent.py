@@ -848,7 +848,9 @@ class NegotiationAgent:
         # deals() outputs: (farmer, buyer, agreedPrice, quantity, dealTimestamp, escrowAmount, round, state, ...)
         deal_info = self._trade.functions.deals(deal_id).call()
         on_chain_round: int = deal_info[6]
-        if on_chain_round > 0:
+        # Contract initialises round=1 on submitOffer (buyer's first offer = round 1).
+        # round > 1 means the farmer already countered — skip to avoid duplicate sends.
+        if on_chain_round > 1:
             logger.info(f"[deal {deal_id}] Already at round {on_chain_round} on chain — skipping duplicate send.")
             self._pending_deal_ids.discard(deal_id)
             return
