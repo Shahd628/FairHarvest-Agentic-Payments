@@ -160,7 +160,16 @@
       </div>
     </section>
 
-    <!-- 3. Negotiation (handoff to the agent) -->
+    <!-- 3. Active Deals -->
+    <section class="panel">
+      <h2>Active Deals</h2>
+      <button class="btn secondary" id="loadDealsBtn">Refresh Deals</button>
+      <div id="dealsList" style="margin-top:14px">
+        <div class="empty">Click refresh to load deals.</div>
+      </div>
+    </section>
+
+    <!-- 4. Negotiation (handoff to the agent) -->
     <section class="panel hidden" id="negoPanel">
       <div class="nego-head">
         <h2 style="margin:0">Negotiate with Farmi 🤖</h2>
@@ -203,9 +212,9 @@
     const MARKET_ABI = [
       // --- events used to discover farmers and follow negotiations ---
       // ASSUMED: registerPolicy emits this so buyers can enumerate farmers (doc relies on event logs)
-      "event FarmerRegistered(address indexed farmer, uint256 minPriceRatio, uint256 maxDealSize, uint256 maxRounds, uint256 maxConcurrentDeals)",
+      "event FarmerRegistered(address indexed farmer)",
       "event OfferSubmitted(uint256 indexed dealId, address indexed buyer, address indexed farmer, uint256 price, uint256 quantity)",
-      "event CounterOffered(uint256 indexed dealId, uint256 price, uint8 round, address by)",
+      "event CounterOffered(uint256 indexed dealId, address indexed caller, uint256 price, uint8 round)",
       "event DealAccepted(uint256 indexed dealId, uint256 price)",
       "event EscrowFunded(uint256 indexed dealId, uint256 amount)",
       // --- reads ---
@@ -215,8 +224,10 @@
       "function submitOffer(address farmer, uint256 price, uint256 quantity) returns (uint256)",
       "function counterOffer(uint256 dealId, uint256 price)",
       "function acceptDeal(uint256 dealId)",
-      "function fundEscrow(uint256 dealId) payable"
-    ];
+      "function fundEscrow(uint256 dealId) payable",
+
+      "function nextDealId() view returns (uint256)",
+      "function deals(uint256) view returns (address farmer, address buyer, uint256 agreedPrice, uint256 quantity, uint256 dealTimestamp, uint256 escrowAmount, uint8 round, uint8 state, string trackingUrl, bool farmerSigned, bool buyerSigned)",    ];
 
     // ASSUMED: oracle getPrice returns (price, timestamp); reverts if stale (>2h) per design
     const ORACLE_ABI = [
@@ -244,6 +255,53 @@
     $("loadBtn").onclick = loadContracts;
     $("sendOfferBtn").onclick = sendOffer;
     $("closeNego").onclick = closeNego;
+
+    $("loadDealsBtn").onclick = loadDeals;
+
+    const DEAL_STATES = ["Negotiating", "Funded", "Shipped", "Disputed", "Complete", "Refunded"];
+
+    async function loadDeals() {
+      const container = $("dealsList");
+      container.innerHTML = '<div class="empty">Loading…</div>';
+      
+      try {
+        const total = await market.nextDealId();
+        const count = total.toNumber();
+        
+        if (count === 0) {
+          container.innerHTML = '<div class="empty">No deals yet.</div>';
+          return;
+        }
+
+        container.innerHTML = "";
+        for (let i = count - 1; i >= 0; i--) {
+          const d = await market.deals(i);
+          const state = DEAL_STATES[d.state] || "Unknown";
+          const price = (d.agreedPrice / 1000000).toFixed(2);
+          const farmerShort = d.farmer.slice(0,6) + "…" + d.farmer.slice(-4);
+          const buyerShort  = d.buyer.slice(0,6)  + "…" + d.buyer.slice(-4);
+
+          const card = document.createElement("div");
+          card.className = "card";
+          card.style.marginBottom = "10px";
+          card.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span class="crop" style="font-size:15px">Deal #${i}</span>
+              <span class="chip">${state}</span>
+            </div>
+            <div class="stat-row"><span>Farmer</span><span class="mono">${farmerShort}</span></div>
+            <div class="stat-row"><span>Buyer</span><span class="mono">${buyerShort}</span></div>
+            <div class="stat-row"><span>Price</span><span>${price} TL/kg</span></div>
+            <div class="stat-row"><span>Quantity</span><span>${d.quantity} kg</span></div>
+            <div class="stat-row"><span>Round</span><span>${d.round}</span></div>
+            <div class="stat-row"><span>Escrow</span><span>${ethers.utils.formatEther(d.escrowAmount)} ETH</span></div>
+          `;
+          container.appendChild(card);
+        }
+      } catch(e) {
+        container.innerHTML = `<div class="empty" style="color:red">Error: ${e.message}</div>`;
+      }
+    }
 
     function setStatus(el, msg, isErr) {
       el.textContent = msg;
@@ -348,6 +406,7 @@
         block: ev.blockNumber
       });
      }
+    
 
       const farmers = [...byFarmer.values()].sort((x, y) => y.block - x.block);
       if (!farmers.length) {
@@ -438,7 +497,7 @@
         }
       });
 
-      market.on("CounterOffered", (dealId, price, round, by) => {
+      market.on("CounterOffered", (dealId, caller, price, round) => {
         if (activeDealId && dealId.toString() === activeDealId) {
           const fromAgent = !account || by.toLowerCase() !== account.toLowerCase();
           if (fromAgent) addMsg("agent", "Farmi 🤖", `Counter-offer: ${(price/1000000).toFixed(2)} / 1kg  (round ${round})`);
