@@ -203,7 +203,7 @@
     const MARKET_ABI = [
       // --- events used to discover farmers and follow negotiations ---
       // ASSUMED: registerPolicy emits this so buyers can enumerate farmers (doc relies on event logs)
-      "event PolicyRegistered(address indexed farmer, uint256 minPriceRatio, uint256 maxDealSize, uint256 maxRounds, uint256 maxConcurrentDeals)",
+      "event FarmerRegistered(address indexed farmer, uint256 minPriceRatio, uint256 maxDealSize, uint256 maxRounds, uint256 maxConcurrentDeals)",
       "event OfferSubmitted(uint256 indexed dealId, address indexed buyer, address indexed farmer, uint256 price, uint256 quantity)",
       "event CounterOffered(uint256 indexed dealId, uint256 price, uint8 round, address by)",
       "event DealAccepted(uint256 indexed dealId, uint256 price)",
@@ -318,7 +318,7 @@
       }
     }
 
-    // --- Discover farmers from PolicyRegistered logs, de-duped to latest policy ---
+    // --- Discover farmers from FarmerRegistered logs, de-duped to latest policy ---
     async function loadListings() {
       const container = $("listings");
       container.innerHTML = '<div class="empty">Scanning event logs…</div>';
@@ -329,25 +329,26 @@
       while (from <= latest) {
         const to = Math.min(from + CHUNK - 1, latest);
         try {
-          const batch = await market.queryFilter(market.filters.PolicyRegistered(), from, to);
+          const batch = await market.queryFilter(market.filters.FarmerRegistered(), from, to);
           events.push(...batch);
         } catch (_) { /* range with no logs / provider hiccup — keep going */ }
         from = to + 1;
       }
 
       // latest policy per farmer wins
-      const byFarmer = new Map();
-      for (const ev of events) {
-        const a = ev.args;
-        byFarmer.set(a.farmer.toLowerCase(), {
-          farmer: a.farmer,
-          minPriceRatio: a.minPriceRatio.toString(),
-          maxDealSize: a.maxDealSize.toString(),
-          maxRounds: a.maxRounds.toString(),
-          maxConcurrentDeals: a.maxConcurrentDeals ? a.maxConcurrentDeals.toString() : "—",
-          block: ev.blockNumber
-        });
-      }
+     const byFarmer = new Map();
+     for (const ev of events) {
+      const farmerAddr = ev.args.farmer;
+      const policy = await market.policies(farmerAddr);
+      byFarmer.set(farmerAddr.toLowerCase(), {
+        farmer: farmerAddr,
+        minPriceRatio: policy.minPriceRatio.toString(),
+        maxDealSize: policy.maxDealSize.toString(),
+        maxRounds: policy.maxRounds.toString(),
+        maxConcurrentDeals: "—",
+        block: ev.blockNumber
+      });
+     }
 
       const farmers = [...byFarmer.values()].sort((x, y) => y.block - x.block);
       if (!farmers.length) {
