@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 /**
  * @title  IOracle
- * @notice Interface to MockOracle. getPrice() returns (price, timestamp)
+ * @notice Interface to Shahd's MockOracle. getPrice() returns (price, timestamp)
  *         and REVERTS if the price is stale (>2h), which propagates up into
  *         acceptDeal() and causes it to revert too — exactly as the spec wants.
  */
